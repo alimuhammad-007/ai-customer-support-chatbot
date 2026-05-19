@@ -1,9 +1,10 @@
-pip install streamlit
-pip install langchain
-pip install langchain-community
-pip install langchain-text-splitters
-pip install langchain-groq
-pip install sentence-transformers
-pip install faiss-cpu
-pip install python-dotenv
-pip install pypdf
+streamlit
+langchain
+langchain-community
+langchain-text-splitters
+langchain-groq
+sentence-transformers
+faiss-cpu
+python-dotenv
+pypdf
+requests
