@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🤖 AI Customer Support Chatbot
 
 An AI-powered customer support chatbot built using RAG (Retrieval-Augmented Generation).  
@@ -51,3 +52,7 @@ Similarity Search
 Groq LLM
     ↓
 AI Response
+=======
+# ai-customer-support-chatbot
+Customer Support Chatbot built with Python and AI to automate responses and improve user support experience.
+>>>>>>> b993eb135297e6b2fc07df368809803a2da07f43
