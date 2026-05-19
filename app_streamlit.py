@@ -29,9 +29,11 @@ st.set_page_config(
 # Use st.secrets for Streamlit Cloud deployment, or os.environ for local.
 def get_api_key():
     try:
-        return st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY"))
-    except FileNotFoundError:
-        return os.environ.get("GROQ_API_KEY")
+        if "GROQ_API_KEY" in st.secrets:
+            return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("GROQ_API_KEY")
 
 GROQ_API_KEY = get_api_key()
 
