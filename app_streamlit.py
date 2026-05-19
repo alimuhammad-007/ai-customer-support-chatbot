@@ -1,17 +1,18 @@
 import streamlit as st
 import os
-import time
-import dotenv
+import tempfile
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-
-# -----------------------------
-# LOAD ENV
-# -----------------------------
-dotenv.load_dotenv()
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 
 # -----------------------------
 # PAGE CONFIG
@@ -22,21 +23,37 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🤖 AI Customer Support Chatbot")
+# -----------------------------
+# ENVIRONMENT VARIABLES & SECRETS
+# -----------------------------
+# Use st.secrets for Streamlit Cloud deployment, or os.environ for local.
+def get_api_key():
+    try:
+        return st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY"))
+    except FileNotFoundError:
+        return os.environ.get("GROQ_API_KEY")
+
+GROQ_API_KEY = get_api_key()
 
 # -----------------------------
 # LOAD MODELS (CACHE)
 # -----------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_models():
-
+    """Load embeddings and LLM once for performance."""
+    if not GROQ_API_KEY:
+        st.error("🚨 GROQ_API_KEY is missing. Add it to environment variables or Streamlit secrets.")
+        st.stop()
+        
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
     llm = ChatGroq(
-        api_key=os.getenv("GROQ_API_KEY"),
-        model="llama-3.3-70b-versatile"
+        api_key=GROQ_API_KEY,
+        model="llama-3.3-70b-versatile",
+        temperature=0.2, # Lower temperature for more factual answers
+        max_tokens=1024
     )
 
     return embeddings, llm
@@ -44,93 +61,56 @@ def load_models():
 embeddings, llm = load_models()
 
 # -----------------------------
-# SESSION STATE
+# UTILITY FUNCTIONS
 # -----------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+def process_pdfs(uploaded_files):
+    """Safely process uploaded PDFs and create vector store."""
+    docs = []
+    
+    for file in uploaded_files:
+        # Secure file handling with tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_file.write(file.read())
+            temp_path = temp_file.name
 
-if "db" not in st.session_state:
-    st.session_state.db = None
+        try:
+            loader = PyPDFLoader(temp_path)
+            docs.extend(loader.load())
+        except Exception as e:
+            st.error(f"Error loading {file.name}: {str(e)}")
+        finally:
+            # Always clean up temp files
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-# -----------------------------
-# SIDEBAR
-# -----------------------------
-with st.sidebar:
+    if not docs:
+        st.warning("No text could be extracted from the uploaded PDFs.")
+        return None
 
-    st.header("📄 Upload PDFs")
+    # Optimized Chunking Strategy for better context retrieval
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    chunks = splitter.split_documents(docs)
 
-    uploaded_files = st.file_uploader(
-        "Upload one or more PDF files",
-        type="pdf",
-        accept_multiple_files=True
+    # Create FAISS database in-memory (no need to save local unless requested)
+    db = FAISS.from_documents(chunks, embeddings)
+    return db
+
+def get_rag_chain(db):
+    """Create a highly optimized RAG chain using LangChain Expression Language (LCEL)."""
+    retriever = db.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4} # Fetch top 4 most relevant chunks
     )
 
-    if st.button("Process PDFs"):
-
-        if uploaded_files:
-
-            with st.spinner("Processing PDFs..."):
-
-                docs = []
-
-                # save + load PDFs
-                for file in uploaded_files:
-
-                    temp_path = f"temp_{file.name}"
-
-                    with open(temp_path, "wb") as f:
-                        f.write(file.read())
-
-                    loader = PyPDFLoader(temp_path)
-                    docs.extend(loader.load())
-
-                # split text
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500,
-                    chunk_overlap=50
-                )
-
-                chunks = splitter.split_documents(docs)
-
-                # create FAISS db
-                db = FAISS.from_documents(chunks, embeddings)
-
-                # save vector db
-                db.save_local("vectorstore")
-
-                # load vector db
-                st.session_state.db = FAISS.load_local(
-                    "vectorstore",
-                    embeddings,
-                    allow_dangerous_deserialization=True
-                )
-
-            st.success("PDFs processed successfully ✔")
-
-        else:
-            st.warning("Please upload at least one PDF.")
-
-# -----------------------------
-# CHAT FUNCTION
-# -----------------------------
-def ask_bot(question):
-
-    if st.session_state.db is None:
-        return "Please upload and process PDFs first."
-
-    # similarity search
-    docs = st.session_state.db.similarity_search(question, k=2)
-
-    # shorter context = faster response
-    context = "\n\n".join(
-        [doc.page_content[:300] for doc in docs]
-    )
-
-    # optimized prompt
-    prompt = f"""
-You are a helpful AI customer support assistant.
-
-Answer only from the provided context.
+    template = """
+You are a highly professional, helpful, and concise AI Customer Support Assistant.
+Answer the user's question accurately based ONLY on the provided context.
+If the answer is not contained in the context, politely inform the user that you do not have that information.
+Do not make up information or guess.
 
 Context:
 {context}
@@ -138,67 +118,103 @@ Context:
 Question:
 {question}
 
-Give a short and clear answer.
-"""
+Answer:"""
+    prompt = ChatPromptTemplate.from_template(template)
 
-    response = llm.invoke(prompt)
+    def format_docs(retrieved_docs):
+        return "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-    return response.content
+    # Modern LCEL chain
+    rag_chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    return rag_chain
 
 # -----------------------------
-# SHOW CHAT HISTORY
+# UI & MAIN APP
 # -----------------------------
+st.title("🤖 AI Customer Support Chatbot")
+st.markdown("Upload your company PDFs and ask questions instantly!")
+
+# Session State Initialization
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "db" not in st.session_state:
+    st.session_state.db = None
+
+# Sidebar
+with st.sidebar:
+    st.header("📄 Document Upload")
+    st.markdown("Upload knowledge base files for the AI.")
+    
+    uploaded_files = st.file_uploader(
+        "Upload PDF files",
+        type="pdf",
+        accept_multiple_files=True
+    )
+
+    if st.button("Train AI", use_container_width=True, type="primary"):
+        if uploaded_files:
+            with st.spinner("Analyzing and training on PDFs..."):
+                db = process_pdfs(uploaded_files)
+                if db:
+                    st.session_state.db = db
+                    st.success("Training complete! The AI is ready. ✔")
+        else:
+            st.warning("Please upload at least one PDF.")
+            
+    if st.session_state.db is not None:
+        st.success("✅ Database loaded and ready.")
+        if st.button("Clear Memory", use_container_width=True):
+            st.session_state.db = None
+            st.session_state.messages = []
+            st.rerun()
+
+# Chat Interface
 for message in st.session_state.messages:
-
     with st.chat_message(message["role"]):
-
         st.markdown(message["content"])
 
-# -----------------------------
-# CHAT INPUT
-# -----------------------------
-user_input = st.chat_input("Ask your question...")
+user_input = st.chat_input("How can I help you today?")
 
-# -----------------------------
-# HANDLE USER INPUT
-# -----------------------------
 if user_input:
-
-    # store user message
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input
-    })
-
-    # show user message
+    # Append & display user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # assistant response
+    # Guard clause if DB isn't ready
+    if st.session_state.db is None:
+        with st.chat_message("assistant"):
+            warning_msg = "Please upload and train the AI on PDFs first using the sidebar."
+            st.warning(warning_msg)
+            st.session_state.messages.append({"role": "assistant", "content": warning_msg})
+        st.stop()
+
+    # Generate & stream response
     with st.chat_message("assistant"):
-
         message_placeholder = st.empty()
-
-        # loading effect
-        with st.spinner("Thinking..."):
-
-            answer = ask_bot(user_input)
-
-        # typing animation
         full_response = ""
+        
+        try:
+            rag_chain = get_rag_chain(st.session_state.db)
+            
+            # Stream response for fast UX
+            for chunk in rag_chain.stream(user_input):
+                full_response += chunk
+                message_placeholder.markdown(full_response + "▌")
+                
+            message_placeholder.markdown(full_response)
+            
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
+            full_response = "Sorry, I encountered an error while processing your request."
 
-        for char in answer:
-
-            full_response += char
-
-            message_placeholder.markdown(full_response + "▌")
-
-            time.sleep(0.005)
-
-        message_placeholder.markdown(full_response)
-
-    # store assistant response
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": full_response
-    })
+    # Save assistant message
+    if full_response:
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
