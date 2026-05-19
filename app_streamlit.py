@@ -1,7 +1,7 @@
 import streamlit as st
 import os
 import time
-from dotenv import load_dotenv
+import dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,7 +12,7 @@ from langchain_groq import ChatGroq
 # -----------------------------
 # LOAD ENV
 # -----------------------------
-load_dotenv()
+dotenv.load_dotenv()
 
 # -----------------------------
 # PAGE CONFIG
